@@ -1,0 +1,171 @@
+---
+- name: Install Kubernetes on Ubuntu
+  hosts: k8s
+  become: yes
+  tasks:
+    # Kubernetes GPG Anahtarını Ekle
+    - name: Add Kubernetes GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
+      become: yes
+
+    # Kubernetes Deposu Ekle
+    - name: Add Kubernetes repository
+      shell: |
+        echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+      become: yes
+
+    # Paket listelerini güncelle
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+      become: yes
+
+    # Kubernetes bileşenlerini yükle
+    - name: Install Kubernetes packages (kubelet, kubeadm, kubectl)
+      apt:
+        name:
+          - kubelet=1.31.0-1.1
+          - kubeadm=1.31.0-1.1
+          - kubectl=1.31.0-1.1
+        state: present
+      become: yes
+
+    - name: Hold Kubernetes packages
+      command: apt-mark hold kubelet kubeadm kubectl
+      become: yes
+
+    # Kubelet servisini etkinleştir
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+      become: yes
+
+- name: Initialize Kubernetes master
+  hosts: "{{ groups['masters'][0] }}"
+  become: yes
+  tasks:
+    - name: Run kubeadm init
+      command: "kubeadm init --pod-network-cidr '10.244.0.0/16' --control-plane-endpoint '{{ hostvars['main-master']['ansible_host'] }}' --upload-certs"
+      become: yes
+      register: kubeadm_init_output  # Çıktıyı kaydet
+
+    - name: Show kubeadm init output
+      debug:
+        var: kubeadm_init_output.stdout  # Çıktıyı ekrana yazdır
+
+    
+    - name: Remove existing kube config file
+      command: "sudo rm -f /home/{{ ansible_user }}/.kube/config"
+      become: yes
+      
+    - name: Create .kube directory
+      shell: "mkdir -p /home/{{ ansible_user }}/.kube"
+      become: yes
+
+    - name: Copy admin.conf to user's kube config
+      command: "cp -i /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config"
+      become: yes
+
+    - name: Change ownership of kube config
+      command: "chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.kube"
+      become: yes
+
+    
+    - name: Apply Flannel network
+      command: >
+        kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+    
+    - name: Taint nodes if only one master exists
+      command: >
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane:NoSchedule-
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: groups['masters'] | length == 1
+
+    - name: Get the kubeadm join command
+      command: "kubeadm token create --print-join-command"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: kubeadm_join_command
+
+    - name: Save join command as a fact
+      set_fact:
+        kubeadm_join_command_all_nodes: "{{ kubeadm_join_command.stdout }}"
+
+
+    - name: Extract certificate key
+      shell: |
+        kubeadm init phase upload-certs --upload-certs
+      register: certificate_key_output
+
+    - name: Save certificate key
+      set_fact:
+        certificate_key_all_nodes: "{{ certificate_key_output.stdout_lines[-1].split(': ')[-1] }}" 
+
+    - name: Show join command
+      debug:
+        var: kubeadm_join_command  # Join komutunu ekrana yazdır
+
+
+- name: Join control-plane node to the cluster
+  hosts: "{{ groups['masters'][1:] }}"
+  become: true
+  pre_tasks:
+    - name: Skip play if only one control-plane exists
+      debug:
+        msg: "There is only one control-plane machine, so no other control-plane machines can be added to the cluster."
+      when: groups['masters'] | length == 1
+      run_once: true
+      failed_when: false
+      changed_when: false
+      tags: skip
+
+  tasks:
+    - name: Join control-plane node to the cluster using the join command
+      command: "{{ hostvars[groups['masters'][0]]['kubeadm_join_command_all_nodes'] }} --control-plane --certificate-key {{ hostvars[groups['masters'][0]]['certificate_key_all_nodes'] }}"
+      become: true  
+    
+    - name: Remove existing kube config file
+      command: "sudo rm -f /home/{{ ansible_user }}/.kube/config"
+      become: yes
+    
+    - name: Create .kube directory
+      shell: "mkdir -p /home/{{ ansible_user }}/.kube"
+      become: yes
+
+    - name: Copy admin.conf to user's kube config
+      command: "cp -i /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config"
+      become: yes
+
+    - name: Change ownership of kube config
+      command: "chown -R {{ ansible_user }}:{{ ansible_user }} /home/{{ ansible_user }}/.kube"
+      become: yes
+
+    - name: Show the length of masters group
+      debug:
+        msg: "The number of masters is {{ groups['masters'] | length }}"
+
+
+
+- name: Join worker node to the cluster
+  hosts: workers
+  become: true
+  pre_tasks:
+    - name: Skip play if there are no worker nodes
+      debug:
+        msg: "There are no workers' machines"
+      when: groups['workers'] | length == 0
+      run_once: true
+      failed_when: false
+      changed_when: false
+      tags: skip
+
+  tasks:
+    - name: Join worker node to the cluster using the exact join command
+      command: "{{ hostvars[groups['masters'][0]]['kubeadm_join_command'].stdout }}"
+      become: true
