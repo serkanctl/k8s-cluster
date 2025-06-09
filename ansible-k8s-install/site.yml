@@ -1,0 +1,3 @@
+---
+- import_playbook: setup-containerd.yml
+- import_playbook: install-k8s.yml
